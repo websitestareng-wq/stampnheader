@@ -1,10 +1,12 @@
 import { readFile } from "fs/promises";
 import path from "path";
 import {
+  BlendMode,
   PDFArray,
   PDFDict,
   PDFDocument,
-  PDFEmbeddedPage,
+PDFEmbeddedPage,
+PDFImage,
   PDFHexString,
   PDFName,
   PDFNumber,
@@ -17,16 +19,26 @@ import { getSessionCookieName, verifySessionToken } from "@/lib/auth";
 type Company = "star" | "service";
 type OverlayMode = "header" | "stamp" | "both";
 
+type StampBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type PageOverlay = {
   page: number;
   mode: OverlayMode;
+  stamp?: StampBox;
 };
 
 type OverlayCacheItem = {
   pdf: PDFDocument;
   embeddedPage: PDFEmbeddedPage;
 };
-
+type StampImageCacheItem = {
+  image: PDFImage;
+};
 function addLinkAnnotation(
   pdf: PDFDocument,
   page: ReturnType<PDFDocument["getPage"]>,
@@ -70,11 +82,7 @@ function copyOverlayLinksToInvoicePage(
   targetPage: ReturnType<PDFDocument["getPage"]>,
 ) {
   const sourcePage = sourcePdf.getPage(0);
-
-  const sourceAnnots = sourcePage.node.lookupMaybe(
-    PDFName.of("Annots"),
-    PDFArray,
-  );
+  const sourceAnnots = sourcePage.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
 
   if (!sourceAnnots) return;
 
@@ -86,8 +94,8 @@ function copyOverlayLinksToInvoicePage(
 
   for (let i = 0; i < sourceAnnots.size(); i += 1) {
     const annot = sourceAnnots.lookup(i, PDFDict);
-
     const subtype = annot.lookupMaybe(PDFName.of("Subtype"), PDFName);
+
     if (subtype?.toString() !== "/Link") continue;
 
     const rectArray = annot.lookupMaybe(PDFName.of("Rect"), PDFArray);
@@ -118,10 +126,23 @@ function isOverlayMode(value: unknown): value is OverlayMode {
   return value === "header" || value === "stamp" || value === "both";
 }
 
-function getOverlayFileName(company: Company, mode: OverlayMode) {
-  if (mode === "header") return `${company}-header.pdf`;
-  if (mode === "stamp") return `${company}-stamp.pdf`;
-  return `${company}-header-stamp.pdf`;
+function isValidStampBox(value: unknown): value is StampBox {
+  if (typeof value !== "object" || value === null) return false;
+
+  const stamp = value as Record<string, unknown>;
+
+  return (
+    typeof stamp.x === "number" &&
+    Number.isFinite(stamp.x) &&
+    typeof stamp.y === "number" &&
+    Number.isFinite(stamp.y) &&
+    typeof stamp.width === "number" &&
+    Number.isFinite(stamp.width) &&
+    stamp.width > 0 &&
+    typeof stamp.height === "number" &&
+    Number.isFinite(stamp.height) &&
+    stamp.height > 0
+  );
 }
 
 function parsePageOverlays(value: FormDataEntryValue | null): PageOverlay[] {
@@ -149,6 +170,7 @@ function parsePageOverlays(value: FormDataEntryValue | null): PageOverlay[] {
     return {
       page: item.page,
       mode: item.mode,
+      stamp: isValidStampBox(item.stamp) ? item.stamp : undefined,
     };
   });
 
@@ -159,17 +181,52 @@ function parsePageOverlays(value: FormDataEntryValue | null): PageOverlay[] {
   return pageOverlays;
 }
 
+function getOverlayFileName(company: Company, type: "header" | "stamp") {
+  return `${company}-${type}.pdf`;
+}
+
+function drawFullPageOverlay(
+  page: ReturnType<PDFDocument["getPage"]>,
+  embeddedPage: PDFEmbeddedPage,
+) {
+  const { width, height } = page.getSize();
+
+  page.drawPage(embeddedPage, {
+    x: 0,
+    y: 0,
+    width,
+    height,
+  });
+}
+
+function drawStampOverlay(
+  page: ReturnType<PDFDocument["getPage"]>,
+  stampImage: PDFImage,
+  stamp: StampBox,
+) {
+  const { height } = page.getSize();
+
+  page.drawImage(stampImage, {
+    x: stamp.x,
+    y: height - stamp.y - stamp.height,
+    width: stamp.width,
+    height: stamp.height,
+    blendMode: BlendMode.Multiply,
+  });
+}
+
 export async function POST(request: Request) {
   try {
     const cookieStore = await cookies();
-const token = cookieStore.get(getSessionCookieName())?.value;
+    const token = cookieStore.get(getSessionCookieName())?.value;
 
-if (!verifySessionToken(token)) {
-  return NextResponse.json(
-    { message: "Unauthorized access." },
-    { status: 401 },
-  );
-}
+    if (!verifySessionToken(token)) {
+      return NextResponse.json(
+        { message: "Unauthorized access." },
+        { status: 401 },
+      );
+    }
+
     const formData = await request.formData();
 
     const invoice = formData.get("invoice");
@@ -197,8 +254,6 @@ if (!verifySessionToken(token)) {
       );
     }
 
-    const company: Company = companyRaw;
-
     let pageOverlays: PageOverlay[];
 
     try {
@@ -217,7 +272,6 @@ if (!verifySessionToken(token)) {
 
     const invoiceBytes = await invoice.arrayBuffer();
     const invoicePdf = await PDFDocument.load(invoiceBytes);
-
     const totalPages = invoicePdf.getPageCount();
 
     const validPageOverlays = pageOverlays.filter(
@@ -231,19 +285,18 @@ if (!verifySessionToken(token)) {
       );
     }
 
-    const overlayCache = new Map<OverlayMode, OverlayCacheItem>();
+const overlayCache = new Map<"header", OverlayCacheItem>();
+let stampImageCache: StampImageCacheItem | null = null;
 
-    async function getOverlay(mode: OverlayMode): Promise<OverlayCacheItem> {
-      const cached = overlayCache.get(mode);
+   async function getOverlay(type: "header"): Promise<OverlayCacheItem> {
+      const cached = overlayCache.get(type);
       if (cached) return cached;
-
-      const overlayFileName = getOverlayFileName(company, mode);
 
       const overlayPath = path.join(
         process.cwd(),
         "private",
         "headers",
-        overlayFileName,
+        getOverlayFileName(companyRaw as Company, type),
       );
 
       const overlayBytes = await readFile(overlayPath);
@@ -255,24 +308,45 @@ if (!verifySessionToken(token)) {
         embeddedPage,
       };
 
-      overlayCache.set(mode, overlay);
+      overlayCache.set(type, overlay);
       return overlay;
     }
+async function getStampImage(): Promise<StampImageCacheItem> {
+  if (stampImageCache) return stampImageCache;
 
+const stampPath = path.join(
+  process.cwd(),
+  "public",
+  companyRaw === "star"
+    ? "star-stamp-sign.png"
+    : "service-stamp-sign.png",
+);
+  const stampBytes = await readFile(stampPath);
+  const image = await invoicePdf.embedPng(stampBytes);
+
+  stampImageCache = { image };
+  return stampImageCache;
+}
     for (const item of validPageOverlays) {
       const page = invoicePdf.getPage(item.page - 1);
       const { width, height } = page.getSize();
 
-      const overlay = await getOverlay(item.mode);
+      if (item.mode === "header" || item.mode === "both") {
+        const header = await getOverlay("header");
+        drawFullPageOverlay(page, header.embeddedPage);
+        copyOverlayLinksToInvoicePage(header.pdf, invoicePdf, page);
+      }
 
-      page.drawPage(overlay.embeddedPage, {
-        x: 0,
-        y: 0,
-        width,
-        height,
-      });
+      if (item.mode === "stamp" || item.mode === "both") {
+       const stamp = await getStampImage();
 
-      copyOverlayLinksToInvoicePage(overlay.pdf, invoicePdf, page);
+drawStampOverlay(page, stamp.image, item.stamp ?? {
+  x: 0,
+  y: 0,
+  width,
+  height,
+});
+      }
     }
 
     const finalPdfBytes = await invoicePdf.save();
